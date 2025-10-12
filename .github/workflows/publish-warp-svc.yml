@@ -101,7 +101,7 @@ jobs:
       - name: Download .deb for Bookworm (arm64)
         id: dl_arm64
         run: |
-          URL="https://downloads.cloudflareclient.com/v1/download/bookworm-arm/version/2025.5.943.0"
+          URL="https://downloads.cloudflareclient.com/v1/download/bookworm-arm/version/${{ steps.ver.outputs.value }}"
           mkdir -p dist
           echo "Downloading (arm64): $URL"
           curl -fsSL "$URL" -o dist/warp_arm64.deb
