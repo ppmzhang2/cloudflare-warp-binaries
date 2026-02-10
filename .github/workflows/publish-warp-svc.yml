@@ -1,211 +1,118 @@
-name: Publish warp-svc & warp-cli to a Release
+name: Auto-Publish Warp Trixie Binaries
 
 on:
+  schedule:
+    - cron: "0 0 * * 0"  # Every Sunday at 00:00 UTC
   push:
     branches: [ master ]
-    paths:
-      - "warp-debian.version"   # Trigger only when this file changes
-  workflow_dispatch:            # Allow manual runs too
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  check-and-release:
     runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.check.outputs.version }}
+      update_needed: ${{ steps.check.outputs.update_needed }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read version
-        id: ver
+      - name: Check for new version (Trixie)
+        id: check
         run: |
-          V="$(tr -d ' \t\r\n' < warp-debian.version)"
-          if [ -z "$V" ]; then
-            echo "Version file is empty" >&2
-            exit 1
-          fi
-          echo "value=$V" >> $GITHUB_OUTPUT
+          CODENAME="trixie"
+          ARCH="amd64"
+          PKG="cloudflare-warp"
+          PKG_URL="https://pkg.cloudflareclient.com/dists/${CODENAME}/main/binary-${ARCH}/Packages.gz"
 
-      - name: Install extraction tools
-        run: |
-          sudo apt-get update
-          # ar comes from binutils; tar is present; add xz and zstd support
-          sudo apt-get install -y binutils xz-utils zstd curl
+          # Fetch remote version
+          REMOTE_VER=$(curl -fsSL "$PKG_URL" | gzip -dc | awk -v pkg="$PKG" '$1=="Package:" {p=($2==pkg)} p && $1=="Version:" {print $2; exit}')
+          
+          # Read local version
+          LOCAL_VER=$(cat warp-debian.version 2>/dev/null || echo "none")
 
-      # ===================== AMD64 (intel) =====================
-      - name: Download .deb for Bookworm (amd64/intel)
-        id: dl_amd64
-        run: |
-          URL="https://downloads.cloudflareclient.com/v1/download/bookworm-intel/version/${{ steps.ver.outputs.value }}"
-          mkdir -p dist
-          echo "Downloading (amd64): $URL"
-          curl -fsSL "$URL" -o dist/warp_amd64.deb
-          echo "sha256=$(sha256sum dist/warp_amd64.deb | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "Remote version: $REMOTE_VER"
+          echo "Local version:  $LOCAL_VER"
 
-      - name: Extract warp-svc and warp-cli from amd64 .deb
-        run: |
-          set -euo pipefail
-          rm -rf rootfs-amd64 extracted-amd64 work-amd64 && mkdir -p rootfs-amd64 extracted-amd64 work-amd64
-          pushd work-amd64 >/dev/null
-
-          # .deb is an ar archive: debian-binary, control.tar.*, data.tar.*
-          ar x ../dist/warp_amd64.deb
-
-          DATA_TAR=""
-          COMP=""
-          if   [ -f data.tar.xz  ]; then DATA_TAR="data.tar.xz";  COMP="xz"
-          elif [ -f data.tar.zst ]; then DATA_TAR="data.tar.zst"; COMP="zstd"
-          elif [ -f data.tar.gz  ]; then DATA_TAR="data.tar.gz";  COMP="gz"
+          if [ "$REMOTE_VER" != "$LOCAL_VER" ] && [ -n "$REMOTE_VER" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "version=$REMOTE_VER" >> $GITHUB_OUTPUT
           else
-            echo "No data.tar.* found in the .deb" >&2
-            ls -la
-            exit 1
+            echo "update_needed=false" >> $GITHUB_OUTPUT
           fi
-          echo "Found payload (amd64): $DATA_TAR"
 
-          case "$COMP" in
-            xz)   tar -xJf "$DATA_TAR" -C ../rootfs-amd64 ;;
-            zstd) tar --zstd -xf "$DATA_TAR" -C ../rootfs-amd64 ;;
-            gz)   tar -xzf "$DATA_TAR" -C ../rootfs-amd64 ;;
-          esac
-          popd >/dev/null
+      - name: Setup Tools
+        if: steps.check.outputs.update_needed == 'true'
+        run: sudo apt-get update && sudo apt-get install -y binutils xz-utils zstd curl
 
-          need_missing=0
-          for BIN in warp-svc warp-cli; do
-            # NOTE: Debian payloads usually place these under bin
-            SRC="rootfs-amd64/bin/$BIN"
-            if [ ! -f "$SRC" ]; then
-              echo "$BIN not found at bin/$BIN" >&2
-              need_missing=1
-            else
-              mv "$SRC" "extracted-amd64/${BIN}-amd64"
-              chmod +x "extracted-amd64/${BIN}-amd64"
-              echo "Copied ${BIN}-amd64"
+      # We process both architectures in one job to consolidate the Release assets
+      - name: Extract Binaries (amd64 & arm64)
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.version }}"
+          mkdir -p dist extracted
+          
+          for ARCH in amd64 arm64; do
+            URL="https://pkg.cloudflareclient.com/pool/trixie/main/c/cloudflare-warp/cloudflare-warp_${VERSION}_${ARCH}.deb"
+            echo "Processing $ARCH from $URL"
+            
+            curl -fsSL "$URL" -o "dist/warp_${ARCH}.deb"
+            
+            mkdir -p "work-$ARCH" "rootfs-$ARCH"
+            pushd "work-$ARCH" > /dev/null
+            ar x "../dist/warp_${ARCH}.deb"
+            
+            # Identify and extract the data payload
+            if [ -f data.tar.zst ]; then 
+              tar --zstd -xf data.tar.zst -C ../rootfs-$ARCH
+            elif [ -f data.tar.xz ]; then 
+              tar -xJf data.tar.xz -C ../rootfs-$ARCH
+            else 
+              tar -xzf data.tar.gz -C ../rootfs-$ARCH
             fi
+            popd > /dev/null
+      
+            # DYNAMIC SEARCH: Find the binaries wherever they are in the rootfs
+            for BIN in warp-svc warp-cli; do
+              # find searches recursively; head -n 1 handles duplicates if any
+              FOUND_PATH=$(find "rootfs-$ARCH" -type f -name "$BIN" | head -n 1)
+              
+              if [ -n "$FOUND_PATH" ]; then
+                echo "Found $BIN at: $FOUND_PATH"
+                mv "$FOUND_PATH" "extracted/${BIN}-${ARCH}"
+                chmod +x "extracted/${BIN}-${ARCH}"
+              else
+                echo "::error::Could not find $BIN in $ARCH package!"
+                echo "Directory structure for debugging:"
+                ls -R "rootfs-$ARCH"
+                exit 1
+              fi
+            done
           done
 
-          if [ $need_missing -ne 0 ]; then
-            echo "Package data.tar.* contents for debugging (amd64):" >&2
-            if   [ -f work-amd64/data.tar.xz  ]; then tar -tJf work-amd64/data.tar.xz  | sed 's/^/  /'
-            elif [ -f work-amd64/data.tar.zst ]; then tar --zstd -tf work-amd64/data.tar.zst | sed 's/^/  /'
-            elif [ -f work-amd64/data.tar.gz  ]; then tar -tzf work-amd64/data.tar.gz | sed 's/^/  /'
-            fi
-            exit 1
-          fi
-
-          ls -la extracted-amd64
-
-      # ===================== ARM64 =====================
-      # Using the exact link you provided for arm64
-      - name: Download .deb for Bookworm (arm64)
-        id: dl_arm64
+      - name: Update version file in repo
+        if: steps.check.outputs.update_needed == 'true'
         run: |
-          URL="https://downloads.cloudflareclient.com/v1/download/bookworm-arm/version/${{ steps.ver.outputs.value }}"
-          mkdir -p dist
-          echo "Downloading (arm64): $URL"
-          curl -fsSL "$URL" -o dist/warp_arm64.deb
-          echo "sha256=$(sha256sum dist/warp_arm64.deb | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "${{ steps.check.outputs.version }}" > warp-debian.version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add warp-debian.version
+          git commit -m "chore: update warp to ${{ steps.check.outputs.version }}"
+          git push
 
-      - name: Extract warp-svc and warp-cli from arm64 .deb
-        run: |
-          set -euo pipefail
-          rm -rf rootfs-arm64 extracted-arm64 work-arm64 && mkdir -p rootfs-arm64 extracted-arm64 work-arm64
-          pushd work-arm64 >/dev/null
-
-          ar x ../dist/warp_arm64.deb
-
-          DATA_TAR=""
-          COMP=""
-          if   [ -f data.tar.xz  ]; then DATA_TAR="data.tar.xz";  COMP="xz"
-          elif [ -f data.tar.zst ]; then DATA_TAR="data.tar.zst"; COMP="zstd"
-          elif [ -f data.tar.gz  ]; then DATA_TAR="data.tar.gz";  COMP="gz"
-          else
-            echo "No data.tar.* found in the .deb (arm64)" >&2
-            ls -la
-            exit 1
-          fi
-          echo "Found payload (arm64): $DATA_TAR"
-
-          case "$COMP" in
-            xz)   tar -xJf "$DATA_TAR" -C ../rootfs-arm64 ;;
-            zstd) tar --zstd -xf "$DATA_TAR" -C ../rootfs-arm64 ;;
-            gz)   tar -xzf "$DATA_TAR" -C ../rootfs-arm64 ;;
-          esac
-          popd >/dev/null
-
-          need_missing=0
-          for BIN in warp-svc warp-cli; do
-            SRC="rootfs-arm64/bin/$BIN"
-            if [ ! -f "$SRC" ]; then
-              echo "$BIN not found at bin/$BIN (arm64)" >&2
-              need_missing=1
-            else
-              mv "$SRC" "extracted-arm64/${BIN}-arm64"
-              chmod +x "extracted-arm64/${BIN}-arm64"
-              echo "Copied ${BIN}-arm64"
-            fi
-          done
-
-          if [ $need_missing -ne 0 ]; then
-            echo "Package data.tar.* contents for debugging (arm64):" >&2
-            if   [ -f work-arm64/data.tar.xz  ]; then tar -tJf work-arm64/data.tar.xz  | sed 's/^/  /'
-            elif [ -f work-arm64/data.tar.zst ]; then tar --zstd -tf work-arm64/data.tar.zst | sed 's/^/  /'
-            elif [ -f work-arm64/data.tar.gz  ]; then tar -tzf work-arm64/data.tar.gz | sed 's/^/  /'
-            fi
-            exit 1
-          fi
-
-          ls -la extracted-arm64
-
-      # 1) Create/Update versioned release (immutable tag)
-      - name: Create/Update GitHub Release (versioned) and upload assets
+      - name: Create GitHub Release
+        if: steps.check.outputs.update_needed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: warp-svc-v${{ steps.ver.outputs.value }}
-          name: "warp v${{ steps.ver.outputs.value }} (amd64 + arm64)"
-          files: |
-            extracted-amd64/warp-svc-amd64
-            extracted-amd64/warp-cli-amd64
-            extracted-arm64/warp-svc-arm64
-            extracted-arm64/warp-cli-arm64
-          fail_on_unmatched_files: true
-          replace_assets: true
-          make_latest: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # 2) ALSO maintain a moving 'latest' release with the same assets
-      - name: Create/Update GitHub Release (latest) and upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "warp latest — v${{ steps.ver.outputs.value }} (amd64 + arm64)"
-          body: |
-            Rolling 'latest' release pointing to version v${{ steps.ver.outputs.value }}.
-
-            SHA256(.deb, amd64): ${{ steps.dl_amd64.outputs.sha256 }}
-            SHA256(.deb, arm64): ${{ steps.dl_arm64.outputs.sha256 }}
-          files: |
-            extracted-amd64/warp-svc-amd64
-            extracted-amd64/warp-cli-amd64
-            extracted-arm64/warp-svc-arm64
-            extracted-arm64/warp-cli-arm64
-          fail_on_unmatched_files: true
-          replace_assets: true
+          tag_name: v${{ steps.check.outputs.version }}
+          name: "Warp Trixie v${{ steps.check.outputs.version }}"
+          body: "Automated extraction from Debian Trixie repository."
+          files: extracted/*
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Summary
-        run: |
-          echo "Version (file): ${{ steps.ver.outputs.value }}"
-          echo "Release tag (versioned): warp-svc-v${{ steps.ver.outputs.value }}"
-          echo "Release tag (moving): latest"
-          echo "SHA256(.deb, amd64): ${{ steps.dl_amd64.outputs.sha256 }}"
-          echo "SHA256(.deb, arm64): ${{ steps.dl_arm64.outputs.sha256 }}"
-          echo "Assets:"
-          echo " - warp-svc-amd64"
-          echo " - warp-cli-amd64"
-          echo " - warp-svc-arm64"
-          echo " - warp-cli-arm64"
